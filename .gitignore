@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Runtime state (lives in the /data volume, not the repo)
+data/
+
+# Local working files (not part of the public distribution)
+CLAUDE.md
+WORKLOG.md
+PLACEHOLDERS.md
+.claude/

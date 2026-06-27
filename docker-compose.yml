@@ -1,0 +1,12 @@
+# Standalone deployment for the inKind monitor.
+# Usage:  cp .env.example .env  &&  edit .env  &&  docker compose up --build -d
+services:
+  inkind:
+    build: .
+    env_file: .env
+    environment:
+      # TZ controls the local time cron uses for the schedule. Override in .env.
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
