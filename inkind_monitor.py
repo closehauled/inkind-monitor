@@ -222,6 +222,31 @@ def abbrev_address(address):
     return out
 
 
+# Week order for closed-day reporting: inKind operating_hours days are uppercase
+# full names; we display 3-letter abbreviations in Mon..Sun order.
+_WEEK = [("MONDAY", "Mon"), ("TUESDAY", "Tue"), ("WEDNESDAY", "Wed"),
+         ("THURSDAY", "Thu"), ("FRIDAY", "Fri"), ("SATURDAY", "Sat"), ("SUNDAY", "Sun")]
+
+
+def closed_days(operating_hours):
+    """From inKind operating_hours (a list of {day, time_ranges}), return the
+    days the venue is closed, in week order. A day counts as open only if it
+    appears with at least one non-empty time range.
+
+      None  -> hours unknown (operating_hours missing or empty)
+      []    -> open every day (no closed days)
+      list  -> closed-day abbreviations, e.g. ["Mon", "Tue"]
+    """
+    if not operating_hours:
+        return None
+    open_days = {
+        (entry.get("day") or "").upper()
+        for entry in operating_hours
+        if entry.get("time_ranges")
+    }
+    return [abbr for full, abbr in _WEEK if full not in open_days]
+
+
 def extract_nearby(catalog, blacklist):
     """Return {location_id: venue_dict} for venues within RADIUS_MI of the
     filter centroid, minus blacklist. Display distance (dist_mi) is measured from
@@ -258,6 +283,7 @@ def extract_nearby(catalog, blacklist):
             "dist_mi": round(dist, 1),
             "newly_added": TAG_NEWLY_ADDED in tag_ids,
             "leaving_soon": TAG_LEAVING_SOON in tag_ids,
+            "closed_days": closed_days(loc.get("operating_hours")),
         }
     return nearby
 
@@ -298,6 +324,17 @@ def diff(prev_venues, curr):
 
 
 # ── Email: plain text ─────────────────────────────────────────────────────────
+def _closed_label(v):
+    """Human label for a venue's closed days: 'Closed Mon, Tue', 'Open daily',
+    or 'Hours unknown'. Driven by the closed_days field set in extract_nearby."""
+    cd = v.get("closed_days")
+    if cd is None:
+        return "Hours unknown"
+    if not cd:
+        return "Open daily"
+    return "Closed " + ", ".join(cd)
+
+
 def _venue_line(v, marker=""):
     addr = v.get("address_short") or abbrev_address(v.get("address", ""))
     bits = [v["name"]]
@@ -305,6 +342,7 @@ def _venue_line(v, marker=""):
         bits.append(f"{v['dist_mi']} mi")
     if addr:
         bits.append(addr)
+    bits.append(_closed_label(v))
     line = "  - " + "  -  ".join(bits)
     if marker:
         line += f"  {marker}"
@@ -375,6 +413,7 @@ def _highlight_row(v):
         meta_bits.append(f'{v["dist_mi"]} mi')
     if addr:
         meta_bits.append(_esc(addr))
+    meta_bits.append(_esc(_closed_label(v)))
     meta = " &middot; ".join(meta_bits)
     return (f'<tr><td style="padding:11px 0;border-bottom:1px solid {C_BORDER};">'
             f'<div style="font-family:{F_SANS};font-weight:500;font-size:16px;color:{C_TEXT};line-height:1.3;">{nm}</div>'
@@ -403,6 +442,7 @@ def _full_row(v):
     meta_bits = [f'{v["dist_mi"]} mi']
     if addr:
         meta_bits.append(_esc(addr))
+    meta_bits.append(_esc(_closed_label(v)))
     meta = " &middot; ".join(meta_bits)
     return (
         f'<tr>'

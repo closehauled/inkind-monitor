@@ -109,8 +109,10 @@ names.)
 
 Highlights first (newly added, then leaving soon, then removed). The **full
 nearby list** is at the bottom, sorted by distance from the sort anchor, with
-`[NEW]` / `[LEAVING]` markers inline. Each venue name links to a Google Maps
-search (hours, photos, reviews, menu), since inKind has no useful per-venue
+`[NEW]` / `[LEAVING]` markers inline. Each venue line also shows an open/closed
+label (`Open daily`, `Closed Mon, Tue`, or `Hours unknown`) derived from the
+catalog's `operating_hours`. Each venue name links to a Google Maps search
+(full hours, photos, reviews, menu), since inKind has no useful per-venue
 detail page. Both plain-text and HTML parts are sent.
 
 ## State files
