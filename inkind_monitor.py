@@ -223,9 +223,9 @@ def abbrev_address(address):
 
 
 # Week order for closed-day reporting: inKind operating_hours days are uppercase
-# full names; we display 3-letter abbreviations in Mon..Sun order.
-_WEEK = [("MONDAY", "Mon"), ("TUESDAY", "Tue"), ("WEDNESDAY", "Wed"),
-         ("THURSDAY", "Thu"), ("FRIDAY", "Fri"), ("SATURDAY", "Sat"), ("SUNDAY", "Sun")]
+# full names; we display 3-letter abbreviations in Sun..Sat order.
+_WEEK = [("SUNDAY", "Sun"), ("MONDAY", "Mon"), ("TUESDAY", "Tue"), ("WEDNESDAY", "Wed"),
+         ("THURSDAY", "Thu"), ("FRIDAY", "Fri"), ("SATURDAY", "Sat")]
 
 
 def closed_days(operating_hours):
