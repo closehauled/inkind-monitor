@@ -13,8 +13,9 @@ The reliable signal is the snapshot diff, not inKind's tags:
     diff (an id that was nearby last run and is gone this run).
 
 State and config live in DATA_DIR (a persistent volume):
-  - snapshot.json   : last nearby set, used for the diff
+  - snapshot.json   : last nearby set + resolved watch ids, used for the diff
   - blacklist.json  : names/substrings to always exclude (auto-seeded)
+  - watchlist.json  : names to always track (any distance), resolved to ids
   - history.jsonl   : append log of every add / leaving / remove event
 
 Email is styled with a minimal design (Syne + IBM Plex Mono, warm white /
@@ -22,6 +23,7 @@ near-black / teal, horizontal rules, no rounded corners), keeping semantic
 green / amber / red for added / leaving / removed.
 """
 
+import html as html_lib
 import json
 import math
 import os
@@ -79,6 +81,7 @@ load_dotenv()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 SNAPSHOT_JSON = DATA_DIR / "snapshot.json"
 BLACKLIST_JSON = DATA_DIR / "blacklist.json"
+WATCHLIST_JSON = DATA_DIR / "watchlist.json"
 HISTORY_LOG = DATA_DIR / "history.jsonl"
 
 MAP_URL = os.environ.get("INKIND_MAP_URL", "https://app.inkind.com/api/v5/map")
@@ -98,6 +101,12 @@ AREA_LABEL = os.environ.get("INKIND_AREA_LABEL", "Downtown Portland")
 SORT_LAT = float(os.environ.get("INKIND_SORT_LAT", "45.5188"))
 SORT_LNG = float(os.environ.get("INKIND_SORT_LNG", "-122.6793"))
 SORT_LABEL = os.environ.get("INKIND_SORT_LABEL", "Pioneer Courthouse Square")
+
+# Sanity floor for the catalog: a fetch that parses but returns fewer than this
+# many locations is treated as a failed fetch, so a degraded/error response
+# cannot read as a mass removal or overwrite the snapshot. Catalog is ~7,750
+# venues today; a real platform collapse below 1,000 would be obvious news.
+MIN_CATALOG = int(os.environ.get("INKIND_MIN_CATALOG", "1000"))
 
 # inKind tag ids of interest (from the catalog's top-level tag dictionary).
 TAG_NEWLY_ADDED = 32
@@ -125,6 +134,15 @@ MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "inkind-monitor@example.com")
 EMAIL_TO = os.environ.get("EMAIL_TO", "")
 
+# Append-only audit log of every send attempt (sent / failed / skipped), one
+# JSON record per line, so "did that alert actually go out?" is answerable
+# later. Defaults to email.jsonl in DATA_DIR; set EMAIL_LOG to move it
+# elsewhere, or to an empty value to disable. Note the records include the
+# recipient address and subject, so keep the file private.
+SERVICE_NAME = "inkind"
+_email_log = os.environ.get("EMAIL_LOG", str(DATA_DIR / "email.jsonl"))
+EMAIL_LOG = Path(_email_log) if _email_log else None
+
 USER_AGENT = "inkind-monitor (https://github.com/closehauled/inkind-monitor)"
 
 # ── Design tokens (Nordic Minimal; inlined because email clients drop :root) ──
@@ -137,6 +155,8 @@ C_BORDER = "#e0e0dc"
 C_GREEN = "#2f8f5f"; C_GREEN_BG = "#dff0e6"; C_GREEN_BD = "#9ed3b3"; C_GREEN_TX = "#14622f"
 C_AMBER = "#c07820"; C_AMBER_BG = "#f6e8cf"; C_AMBER_BD = "#e0bd86"; C_AMBER_TX = "#7a4e12"
 C_RED = "#a02020"; C_RED_BG = "#f3dada"; C_RED_BD = "#d99a9a"; C_RED_TX = "#6e1414"
+# Watched (manual pin): teal outline badge on the accent color.
+C_WATCH_BG = "#d4ece8"; C_WATCH_BD = "#9ccabf"; C_WATCH_TX = "#00564b"
 
 F_SANS = "'Syne','Helvetica Neue',Arial,sans-serif"
 F_MONO = "'IBM Plex Mono','SF Mono',ui-monospace,Menlo,monospace"
@@ -157,7 +177,9 @@ def haversine_mi(lat1, lng1, lat2, lng2):
     dphi = math.radians(lat2 - lat1)
     dlmb = math.radians(lng2 - lng1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
-    return r * 2 * math.asin(math.sqrt(a))
+    # Clamp: float rounding can push `a` a ulp above 1.0 on garbage coordinates,
+    # which would raise a math domain error in asin.
+    return r * 2 * math.asin(math.sqrt(min(1.0, a)))
 
 
 def load_blacklist():
@@ -247,12 +269,46 @@ def closed_days(operating_hours):
     return [abbr for full, abbr in _WEEK if full not in open_days]
 
 
+def build_venue(loc, place, dist, watched=False):
+    """Normalize one catalog location into the venue record used everywhere
+    (snapshot, diff, email). Single source of truth for the venue schema, shared
+    by extract_nearby (radius set) and resolve_watchlist (manual pins)."""
+    # Collapse internal whitespace too: a name carrying a newline could forge
+    # section headers in the plain-text email part.
+    name = re.sub(r"\s+", " ", loc.get("name") or "").strip()
+    addr = place.get("address", "")
+    city = place.get("city", "")
+    state = place.get("state", "")
+    tag_ids = {t.get("id") for t in (loc.get("tags") or [])}
+    return {
+        "location_id": loc.get("location_id"),
+        "name": name,
+        "address": addr,
+        "city": city,
+        "state": state,
+        "zip": place.get("zip_code", ""),
+        "link": loc.get("purchase_page_link", ""),
+        "maps": maps_url(name, addr, city, state),
+        "address_short": abbrev_address(addr),
+        "status": loc.get("status", ""),
+        "dist_mi": round(dist, 1),
+        "newly_added": TAG_NEWLY_ADDED in tag_ids,
+        "leaving_soon": TAG_LEAVING_SOON in tag_ids,
+        "closed_days": closed_days(loc.get("operating_hours")),
+        "watched": watched,
+    }
+
+
 def extract_nearby(catalog, blacklist):
     """Return {location_id: venue_dict} for venues within RADIUS_MI of the
     filter centroid, minus blacklist. Display distance (dist_mi) is measured from
     the sort anchor (SORT_LAT/SORT_LNG), and the list is later ordered by it."""
     nearby = {}
     for loc in catalog.get("locations", []):
+        # An id-less entry would collapse onto the string key "None" and churn
+        # as added/removed; skip it.
+        if loc.get("location_id") is None:
+            continue
         place = loc.get("location") or {}
         lat, lng = place.get("latitude"), place.get("longitude")
         if lat is None or lng is None:
@@ -265,27 +321,105 @@ def extract_nearby(catalog, blacklist):
             continue
         # Shown/sorted distance: from the sort anchor.
         dist = haversine_mi(SORT_LAT, SORT_LNG, lat, lng)
-        tag_ids = {t.get("id") for t in (loc.get("tags") or [])}
-        addr = place.get("address", "")
-        city = place.get("city", "")
-        state = place.get("state", "")
-        nearby[str(loc.get("location_id"))] = {
-            "location_id": loc.get("location_id"),
-            "name": name,
-            "address": addr,
-            "city": city,
-            "state": state,
-            "zip": place.get("zip_code", ""),
-            "link": loc.get("purchase_page_link", ""),
-            "maps": maps_url(name, addr, city, state),
-            "address_short": abbrev_address(addr),
-            "status": loc.get("status", ""),
-            "dist_mi": round(dist, 1),
-            "newly_added": TAG_NEWLY_ADDED in tag_ids,
-            "leaving_soon": TAG_LEAVING_SOON in tag_ids,
-            "closed_days": closed_days(loc.get("operating_hours")),
-        }
+        nearby[str(loc.get("location_id"))] = build_venue(loc, place, dist)
     return nearby
+
+
+def load_watchlist():
+    """Load the manual watchlist, seeding an empty list on first run.
+
+    The file is a bare JSON array of venue names to hand-edit, e.g.
+    ["Some Cafe", "Another Bistro"]. Returns the list of non-empty
+    names (original case preserved for display; matched case-insensitively)."""
+    if not WATCHLIST_JSON.exists():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(WATCHLIST_JSON, "w") as f:
+            json.dump([], f, indent=2)
+        print("  Seeded empty watchlist.json")
+        return []
+    with open(WATCHLIST_JSON) as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        print("  Warning: watchlist.json is not a JSON array; ignoring.")
+        return []
+    return [n.strip() for n in data if isinstance(n, str) and n.strip()]
+
+
+def resolve_watchlist(catalog, watch_names, prev_watch_ids):
+    """Resolve watchlist names to catalog venues, tracking by id once matched.
+
+    Returns (watched, watch_ids):
+      watched   : {location_id: venue_dict} for every name resolved this run
+                  (watched=True), regardless of distance / blacklist.
+      watch_ids : {name_lower: location_id} to persist for next run.
+
+    Resolution per name:
+      - Known id (rename-safe): if we recorded an id last run and it is still in
+        the catalog, reuse it even if the catalog name changed.
+      - Vanished id (left platform): a previously-known id no longer in the
+        catalog is emitted as nothing but kept in watch_ids as a tombstone, so
+        the name is never re-matched by substring to a different venue; the
+        snapshot diff (prev - curr) reports it once as removed.
+      - First resolution: match by name (case-insensitive exact, else unique
+        substring; ties broken by nearest to the sort anchor). No match -> log a
+        typo warning and skip (never emails, so typos cannot false-alarm)."""
+    by_id = {loc.get("location_id"): loc for loc in catalog.get("locations", [])}
+    prev_watch_ids = prev_watch_ids or {}
+    watched, watch_ids = {}, {}
+
+    for name in watch_names:
+        key = name.lower()
+        loc = None
+        known_id = prev_watch_ids.get(key)
+        if known_id is not None:
+            loc = by_id.get(known_id)
+            if loc is None:
+                # Recorded id has left the platform; the snapshot diff reports
+                # the removal once. Keep the id as a tombstone so this name
+                # never falls back to substring matching, which could silently
+                # pin a different venue. To force a fresh resolution (the venue
+                # returned under a new id), remove the name from watchlist.json,
+                # let one run complete, then re-add it.
+                print(f"  Watch '{name}': previously-resolved venue is gone from the catalog (left platform).")
+                watch_ids[key] = known_id
+                continue
+        else:
+            loc = _match_watch_name(name, catalog)
+            if loc is None:
+                print(f"  Watch '{name}': matched no inKind venue (typo, or not on the platform).")
+                continue
+
+        place = loc.get("location") or {}
+        lat, lng = place.get("latitude"), place.get("longitude")
+        dist = haversine_mi(SORT_LAT, SORT_LNG, lat, lng) if lat is not None and lng is not None else 0.0
+        venue = build_venue(loc, place, dist, watched=True)
+        watched[str(loc.get("location_id"))] = venue
+        watch_ids[key] = loc.get("location_id")
+
+    return watched, watch_ids
+
+
+def _match_watch_name(name, catalog):
+    """Find a catalog location for a watch name: case-insensitive exact match,
+    else a unique substring match. Multiple candidates -> nearest to the sort
+    anchor. Returns the location dict, or None."""
+    nl = name.lower()
+    locs = [loc for loc in catalog.get("locations", []) if loc.get("location_id") is not None]
+    exact = [loc for loc in locs if (loc.get("name") or "").strip().lower() == nl]
+    candidates = exact or [loc for loc in locs if nl in (loc.get("name") or "").lower()]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _anchor_dist(loc):
+        place = loc.get("location") or {}
+        lat, lng = place.get("latitude"), place.get("longitude")
+        if lat is None or lng is None:
+            return float("inf")
+        return haversine_mi(SORT_LAT, SORT_LNG, lat, lng)
+
+    return min(candidates, key=_anchor_dist)
 
 
 # ── Snapshot state ──────────────────────────────────────────────────────────
@@ -296,11 +430,16 @@ def load_snapshot():
     return None
 
 
-def save_snapshot(nearby):
+def save_snapshot(nearby, watch_ids=None):
+    """Write the snapshot atomically (temp file + rename), so a crash mid-write
+    cannot leave a truncated snapshot.json that kills every later run."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    data = {"last_updated": datetime.now().isoformat(), "venues": nearby}
-    with open(SNAPSHOT_JSON, "w") as f:
+    data = {"last_updated": datetime.now().isoformat(), "venues": nearby,
+            "watch_ids": watch_ids or {}}
+    tmp = SNAPSHOT_JSON.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, SNAPSHOT_JSON)
 
 
 def append_history(event, venue):
@@ -314,7 +453,10 @@ def append_history(event, venue):
 def diff(prev_venues, curr):
     """Compute added / removed / newly-leaving against the previous snapshot."""
     prev = prev_venues or {}
-    added = [curr[i] for i in curr if i not in prev]
+    # Watched (manually pinned) venues are excluded from "added": a fresh pin
+    # is a manual action, not a new-to-platform venue. Their leaving-soon /
+    # removed alerts still fire (those lists are not filtered).
+    added = [curr[i] for i in curr if i not in prev and not curr[i].get("watched")]
     removed = [prev[i] for i in prev if i not in curr]
     newly_leaving = [
         curr[i] for i in curr
@@ -326,7 +468,7 @@ def diff(prev_venues, curr):
 # ── Email: plain text ─────────────────────────────────────────────────────────
 def _closed_label(v):
     """Human label for a venue's closed days: 'Closed Mon, Tue', 'Open daily',
-    or 'Hours unknown'. Driven by the closed_days field set in extract_nearby."""
+    or 'Hours unknown'. Driven by the closed_days field set in build_venue."""
     cd = v.get("closed_days")
     if cd is None:
         return "Hours unknown"
@@ -379,8 +521,14 @@ def build_text(curr, added, removed, newly_leaving, now, baseline, weekly=False)
     L.append("-" * 48)
     L.append(f"ALL NEARBY VENUES ({n})")
     for v in all_sorted:
-        marker = "[LEAVING]" if v["leaving_soon"] else ("[NEW]" if v["newly_added"] else "")
-        L.append(_venue_line(v, marker))
+        markers = []
+        if v.get("watched"):
+            markers.append("[WATCHED]")
+        if v["leaving_soon"]:
+            markers.append("[LEAVING]")
+        elif v["newly_added"]:
+            markers.append("[NEW]")
+        L.append(_venue_line(v, " ".join(markers)))
     L.append("")
     L.append("Browse on inkind.com: https://inkind.com/locations")
     return "\n".join(L)
@@ -388,7 +536,9 @@ def build_text(curr, added, removed, newly_leaving, now, baseline, weekly=False)
 
 # ── Email: HTML (Nordic Minimal) ──────────────────────────────────────────────
 def _esc(s):
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """Escape for HTML, including quotes, so a value is safe in an attribute as
+    well as in element text."""
+    return html_lib.escape("" if s is None else str(s), quote=True)
 
 
 def _badge(label, bg, bd, tx):
@@ -433,11 +583,14 @@ def _full_row(v):
     nm = _esc(v["name"])
     if v.get("maps"):
         nm = f'<a href="{_esc(v["maps"])}" style="color:{C_TEXT};text-decoration:none;">{nm}</a>'
-    badge = ""
+    badges = []
+    if v.get("watched"):
+        badges.append(_badge("Watched", C_WATCH_BG, C_WATCH_BD, C_WATCH_TX))
     if v["leaving_soon"]:
-        badge = _badge("Leaving", C_AMBER_BG, C_AMBER_BD, C_AMBER_TX)
+        badges.append(_badge("Leaving", C_AMBER_BG, C_AMBER_BD, C_AMBER_TX))
     elif v["newly_added"]:
-        badge = _badge("New", C_GREEN_BG, C_GREEN_BD, C_GREEN_TX)
+        badges.append(_badge("New", C_GREEN_BG, C_GREEN_BD, C_GREEN_TX))
+    badge = "&nbsp;".join(badges)
     addr = v.get("address_short") or abbrev_address(v.get("address", ""))
     meta_bits = [f'{v["dist_mi"]} mi']
     if addr:
@@ -538,7 +691,7 @@ def build_html(curr, added, removed, newly_leaving, now, baseline, weekly=False)
 
 def build_email(curr, added, removed, newly_leaving, *, baseline=False, weekly=False):
     """Return (subject, text_body, html_body)."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
     n = len(curr)
     parts = []
     if added:
@@ -594,30 +747,67 @@ def _send_via_mailgun(subject, text, html=None):
     r.raise_for_status()
 
 
+def log_email(status, subject, detail=""):
+    """Append one record to the email audit log (see EMAIL_LOG above).
+
+    Every send attempt lands here (sent / failed / skipped) so "did that alert
+    actually go out?" is answerable later; provider dashboards typically retain
+    only a short event history, and a missed alert is otherwise invisible.
+    Never raises: a logging problem must not break an email.
+    """
+    if EMAIL_LOG is None:
+        return
+    try:
+        EMAIL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now().astimezone().isoformat(),
+            "service": SERVICE_NAME,
+            "status": status,
+            "to": EMAIL_TO,
+            "subject": subject,
+            "detail": str(detail)[:300],
+        }
+        with open(EMAIL_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        print(f"  Warning: could not write email log: {e}")
+
+
 def send_email(subject, text, html=None):
     """Send an email via SMTP or Mailgun, auto-selected by configuration.
 
     SMTP is used when SMTP_HOST is set (works with any provider); otherwise
     Mailgun is used when MAILGUN_API_KEY is set. If neither is configured (or
     EMAIL_TO is missing), the send is skipped with a warning.
+
+    Returns True on success or on a deliberate skip (email not configured, e.g.
+    local dev with EMAIL_TO empty), False when a send was attempted and failed,
+    so callers can avoid consuming state the email should have reported.
     """
     if not EMAIL_TO:
         print("  Warning: EMAIL_TO not set, skipping email.")
-        return
+        log_email("skipped", subject, "EMAIL_TO not set")
+        return True
     try:
         if SMTP_HOST:
             _send_via_smtp(subject, text, html)
         elif MAILGUN_API_KEY:
             if not MAILGUN_DOMAIN:
                 print("  Warning: MAILGUN_API_KEY set but MAILGUN_DOMAIN missing, skipping email.")
-                return
+                log_email("skipped", subject, "MAILGUN_DOMAIN not set")
+                return True
             _send_via_mailgun(subject, text, html)
         else:
             print("  Warning: no SMTP_HOST or MAILGUN_API_KEY set, skipping email.")
-            return
+            log_email("skipped", subject, "no SMTP_HOST or MAILGUN_API_KEY set")
+            return True
         print(f"  Email sent: {subject}")
+        log_email("sent", subject)
+        return True
     except Exception as e:
         print(f"  Warning: could not send email: {e}")
+        log_email("failed", subject, e)
+        return False
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
@@ -645,15 +835,42 @@ def run(weekly=False):
                    "All 3 fetch attempts failed this run. Check container logs.")
         return
 
-    curr = extract_nearby(catalog, blacklist)
-    print(f"Nearby venues (<= {RADIUS_MI:g} mi, blacklist applied): {len(curr)}")
+    # A 200 response that parses but carries a short/missing location list (API
+    # error object, truncation, interstitial) would otherwise diff as a mass
+    # removal and overwrite the snapshot. Treat it as a failed fetch.
+    locs = catalog.get("locations") or []
+    if len(locs) < MIN_CATALOG:
+        print(f"Catalog sanity check failed: {len(locs)} locations (< {MIN_CATALOG}); treating as failed fetch.")
+        send_email(f"inKind {ZIP_CODE}: degraded catalog",
+                   f"Catalog returned only {len(locs)} locations (sanity floor {MIN_CATALOG}). "
+                   "Snapshot left untouched; check container logs and the API response.")
+        return
+
+    nearby = extract_nearby(catalog, blacklist)
+    print(f"Nearby venues (<= {RADIUS_MI:g} mi, blacklist applied): {len(nearby)}")
 
     snap = load_snapshot()
+    prev_watch_ids = (snap or {}).get("watch_ids", {})
+    watched, watch_ids = resolve_watchlist(catalog, load_watchlist(), prev_watch_ids)
+
+    # Merge manual pins into the working set: flag a venue already nearby, or
+    # pull in a far-away one. The diff / digest then treat them uniformly.
+    curr = dict(nearby)
+    for vid, v in watched.items():
+        if vid in curr:
+            curr[vid]["watched"] = True
+        else:
+            curr[vid] = v
+    if watched:
+        print(f"Watched venues resolved: {len(watched)} (total tracked: {len(curr)})")
+
     if snap is None:
         subject, text, html = build_email(curr, [], [], [], baseline=True)
-        send_email(subject, text, html)
-        save_snapshot(curr)
-        print("Baseline snapshot saved.")
+        if send_email(subject, text, html):
+            save_snapshot(curr, watch_ids)
+            print("Baseline snapshot saved.")
+        else:
+            print("Email failed; baseline snapshot NOT saved; will re-baseline next run.")
         return
 
     added, removed, newly_leaving = diff(snap.get("venues", {}), curr)
@@ -664,18 +881,25 @@ def run(weekly=False):
     for v in newly_leaving:
         append_history("leaving_soon", v)
 
+    sent = True
     if weekly:
         print(f"Weekly digest: {len(added)} added, {len(newly_leaving)} leaving, {len(removed)} removed.")
         subject, text, html = build_email(curr, added, removed, newly_leaving, weekly=True)
-        send_email(subject, text, html)
+        sent = send_email(subject, text, html)
     elif added or removed or newly_leaving:
         print(f"Changes: {len(added)} added, {len(newly_leaving)} leaving, {len(removed)} removed.")
         subject, text, html = build_email(curr, added, removed, newly_leaving)
-        send_email(subject, text, html)
+        sent = send_email(subject, text, html)
     else:
         print("No changes since last check; no email sent.")
 
-    save_snapshot(curr)
+    if sent:
+        save_snapshot(curr, watch_ids)
+    else:
+        # history.jsonl already logged these events and will log them again on
+        # the retry run; accepted, it is an append log. The snapshot must not
+        # advance past a diff that was never delivered.
+        print("Email failed; snapshot NOT saved; changes will be re-reported next run.")
 
 
 def run_test():
@@ -704,6 +928,10 @@ def run_test():
     curr2 = dict(curr)
     for v in fake_leaving:
         curr2[str(v["location_id"])] = v
+    # Mark a couple of venues as watched so the [WATCHED] marker / teal badge
+    # renders, including one stacked with [LEAVING].
+    for v in (sample[0], fake_leaving[0]):
+        curr2[str(v["location_id"])] = dict(curr2[str(v["location_id"])], watched=True)
     s, t, h = build_email(curr2, fake_added, fake_removed, fake_leaving)
     send_email("[TEST 2/3] " + s, t, h)
 
@@ -713,10 +941,51 @@ def run_test():
     print("TEST emails sent.")
 
 
+def run_search(term):
+    """Print catalog venues whose name contains `term` (case-insensitive), so a
+    watchlist name can be confirmed against the real inKind roster. Read-only."""
+    catalog = fetch_map()
+    tl = term.lower()
+    hits = [loc for loc in catalog.get("locations", [])
+            if tl in (loc.get("name") or "").lower()]
+    hits.sort(key=lambda loc: (loc.get("name") or "").lower())
+    print(f"{len(hits)} match(es) for '{term}':")
+    for loc in hits:
+        place = loc.get("location") or {}
+        where = ", ".join(p for p in [place.get("city", ""), place.get("state", "")] if p)
+        print(f"  {loc.get('location_id')}  {(loc.get('name') or '').strip()}  ({where})")
+
+
+def _guarded_run(weekly=False):
+    """Run one cycle; on any unexpected crash, alert by email and exit nonzero.
+
+    Without this, a crash after the fetch (malformed hand-edited watchlist /
+    blacklist JSON, a corrupted snapshot, catalog field drift) is visible only
+    in the container logs, and a dead monitor looks exactly like a quiet one:
+    the normal steady state is "no changes, no email".
+    """
+    try:
+        run(weekly=weekly)
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        send_email(f"inKind {ZIP_CODE}: monitor crashed",
+                   "The scheduled run crashed:\n\n" + tb)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     if "--test" in sys.argv:
         run_test()
+    elif "--search" in sys.argv:
+        i = sys.argv.index("--search")
+        term = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        if not term:
+            print("Usage: inkind_monitor.py --search \"<name fragment>\"")
+            sys.exit(2)
+        run_search(term)
     elif "--weekly" in sys.argv:
-        run(weekly=True)
+        _guarded_run(weekly=True)
     else:
-        run()
+        _guarded_run()

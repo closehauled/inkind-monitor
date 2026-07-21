@@ -16,10 +16,20 @@ endpoint: [https://app.inkind.com/api/v5/map](https://app.inkind.com/api/v5/map)
 
 1. Fetches the catalog and filters to venues within `INKIND_RADIUS_MI` of your
    center point.
-2. Applies the name blacklist (`<data>/blacklist.json`).
-3. Diffs the nearby set against the previous run's snapshot
+2. Applies the name blacklist (`<data>/blacklist.json`) and merges in the
+   watchlist (`<data>/watchlist.json`), venues you pin by name regardless of
+   distance.
+3. Diffs the tracked set against the previous run's snapshot
    (`<data>/snapshot.json`).
 4. Emails a digest if anything changed.
+
+A fetch that parses but returns suspiciously few venues (fewer than
+`INKIND_MIN_CATALOG`, default 1000) is treated as a failed fetch rather than a
+mass removal, so a degraded API response cannot wipe the snapshot. If a send
+fails, the snapshot is not advanced, so the same changes are re-reported on the
+next successful run. And if a run crashes outright, the monitor emails the
+traceback and exits nonzero, since a dead monitor otherwise looks exactly like
+a quiet one.
 
 Membership is decided by distance from the filter centroid, but the distances
 shown in the email and the list ordering are measured from a separate sort
@@ -70,6 +80,7 @@ for your area.
 | `INKIND_SORT_LAT` | `45.5188` | Sort/display anchor latitude |
 | `INKIND_SORT_LNG` | `-122.6793` | Sort/display anchor longitude |
 | `INKIND_SORT_LABEL` | `Pioneer Courthouse Square` | Sort anchor label shown in the email |
+| `INKIND_MIN_CATALOG` | `1000` | Sanity floor: fewer catalog locations than this is treated as a failed fetch |
 
 ### Schedule and timezone
 
@@ -105,11 +116,35 @@ Edit it in the data directory to add or remove entries; no rebuild needed, it is
 re-read every run. (A bare JSON array is also accepted and treated as `exact`
 names.)
 
+## Watchlist
+
+`<data>/watchlist.json` pins venues you always want tracked, wherever they are.
+It ships empty (a bare JSON array of names) and is auto-created on first run:
+
+```json
+["Some Cafe", "Another Bistro"]
+```
+
+Names are matched case-insensitively (exact match first, then unique
+substring; ties go to the venue nearest the sort anchor). Once a name resolves,
+the venue is tracked by its catalog id, so it survives renames; if the id later
+vanishes from the catalog, that is reported once as a removal and the name is
+never silently re-matched to a different venue. Watched venues appear in the
+digest with a `[WATCHED]` marker (teal badge in HTML), are exempt from the
+radius filter and blacklist, and do not show up as "newly added" when you first
+pin them; their leaving-soon and removed alerts still fire.
+
+To confirm a name against the real roster before adding it:
+
+```
+DATA_DIR=./data python3 inkind_monitor.py --search "cafe"
+```
+
 ## Email layout
 
 Highlights first (newly added, then leaving soon, then removed). The **full
 nearby list** is at the bottom, sorted by distance from the sort anchor, with
-`[NEW]` / `[LEAVING]` markers inline. Each venue line also shows an open/closed
+`[NEW]` / `[LEAVING]` / `[WATCHED]` markers inline. Each venue line also shows an open/closed
 label (`Open daily`, `Closed Mon, Tue`, or `Hours unknown`) derived from the
 catalog's `operating_hours`. Each venue name links to a Google Maps search
 (full hours, photos, reviews, menu), since inKind has no useful per-venue
@@ -119,9 +154,14 @@ detail page. Both plain-text and HTML parts are sent.
 
 Written to the data directory (`/data` in Docker, `DATA_DIR` standalone):
 
-- `snapshot.json` - last nearby set, used for the diff
+- `snapshot.json` - last tracked set + resolved watch ids, used for the diff
 - `blacklist.json` - excluded venue names
+- `watchlist.json` - pinned venue names (see Watchlist above)
 - `history.jsonl` - append log of every add / leaving / remove event
+- `email.jsonl` - audit log of every send attempt (sent / failed / skipped),
+  so "did that alert actually go out?" is answerable later. Records include
+  the recipient and subject; keep the file private. Move it with `EMAIL_LOG`,
+  or set `EMAIL_LOG` empty to disable.
 
 ## Run with Docker
 
