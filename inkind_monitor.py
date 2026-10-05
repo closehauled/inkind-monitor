@@ -296,6 +296,9 @@ def build_venue(loc, place, dist, watched=False):
         "leaving_soon": TAG_LEAVING_SOON in tag_ids,
         "closed_days": closed_days(loc.get("operating_hours")),
         "watched": watched,
+        # Set by merge_watched for a pin outside the radius set; such venues
+        # render in the "Farther away" section instead of the nearby list.
+        "far": False,
     }
 
 
@@ -422,6 +425,28 @@ def _match_watch_name(name, catalog):
     return min(candidates, key=_anchor_dist)
 
 
+def merge_watched(nearby, watched):
+    """Merge manual pins into the working set: flag a venue already nearby, or
+    pull in one outside the default area marked far=True (listed under "Farther
+    away"). The diff treats both uniformly."""
+    curr = dict(nearby)
+    for vid, v in watched.items():
+        if vid in curr:
+            curr[vid] = dict(curr[vid], watched=True)
+        else:
+            curr[vid] = dict(v, far=True)
+    return curr
+
+
+def split_far(curr):
+    """Split the working set into (nearby, far) lists, each sorted by display
+    distance then name."""
+    key = lambda v: (v["dist_mi"], v["name"].lower())
+    near = sorted((v for v in curr.values() if not v.get("far")), key=key)
+    far = sorted((v for v in curr.values() if v.get("far")), key=key)
+    return near, far
+
+
 # ── Snapshot state ──────────────────────────────────────────────────────────
 def load_snapshot():
     if SNAPSHOT_JSON.exists():
@@ -491,9 +516,20 @@ def _venue_line(v, marker=""):
     return line
 
 
+def _status_markers(v, show_watched=True):
+    markers = []
+    if show_watched and v.get("watched"):
+        markers.append("[WATCHED]")
+    if v["leaving_soon"]:
+        markers.append("[LEAVING]")
+    elif v["newly_added"]:
+        markers.append("[NEW]")
+    return " ".join(markers)
+
+
 def build_text(curr, added, removed, newly_leaving, now, baseline, weekly=False):
-    n = len(curr)
-    all_sorted = sorted(curr.values(), key=lambda v: (v["dist_mi"], v["name"].lower()))
+    all_sorted, far_sorted = split_far(curr)
+    n = len(all_sorted)
     head = "Weekly digest. " if weekly else ""
     L = [f"{head}Within {RADIUS_MI:g} mi of {ZIP_CODE}, distances from {SORT_LABEL}",
          f"Checked: {now}", ""]
@@ -521,15 +557,14 @@ def build_text(curr, added, removed, newly_leaving, now, baseline, weekly=False)
     L.append("-" * 48)
     L.append(f"ALL NEARBY VENUES ({n})")
     for v in all_sorted:
-        markers = []
-        if v.get("watched"):
-            markers.append("[WATCHED]")
-        if v["leaving_soon"]:
-            markers.append("[LEAVING]")
-        elif v["newly_added"]:
-            markers.append("[NEW]")
-        L.append(_venue_line(v, " ".join(markers)))
+        L.append(_venue_line(v, _status_markers(v)))
     L.append("")
+    if far_sorted:
+        # Every far venue is a manual pin, so [WATCHED] would be noise here.
+        L.append(f"FARTHER AWAY ({len(far_sorted)})")
+        for v in far_sorted:
+            L.append(_venue_line(v, _status_markers(v, show_watched=False)))
+        L.append("")
     L.append("Browse on inkind.com: https://inkind.com/locations")
     return "\n".join(L)
 
@@ -579,12 +614,12 @@ def _removed_row(v):
             f'</td></tr>')
 
 
-def _full_row(v):
+def _full_row(v, show_watched=True):
     nm = _esc(v["name"])
     if v.get("maps"):
         nm = f'<a href="{_esc(v["maps"])}" style="color:{C_TEXT};text-decoration:none;">{nm}</a>'
     badges = []
-    if v.get("watched"):
+    if show_watched and v.get("watched"):
         badges.append(_badge("Watched", C_WATCH_BG, C_WATCH_BD, C_WATCH_TX))
     if v["leaving_soon"]:
         badges.append(_badge("Leaving", C_AMBER_BG, C_AMBER_BD, C_AMBER_TX))
@@ -609,13 +644,15 @@ def _full_row(v):
 
 
 def build_html(curr, added, removed, newly_leaving, now, baseline, weekly=False):
-    n = len(curr)
-    all_sorted = sorted(curr.values(), key=lambda v: (v["dist_mi"], v["name"].lower()))
+    all_sorted, far_sorted = split_far(curr)
+    n = len(all_sorted)
 
     # status bar (pipe-separated, top/bottom rules)
     seg = lambda txt, col: f'<span style="color:{col};">{txt}</span>'
     pipe = f'<span style="color:{C_BORDER};padding:0 9px;">|</span>'
     bar = [seg(f'{n} NEARBY', C_TEXT)]
+    if far_sorted:
+        bar.append(seg(f'{len(far_sorted)} FARTHER', C_MUTED))
     if added:
         bar.append(seg(f'+{len(added)} NEW', C_GREEN))
     if newly_leaving:
@@ -678,6 +715,13 @@ def build_html(curr, added, removed, newly_leaving, now, baseline, weekly=False)
     P += [_full_row(v) for v in all_sorted]
     P.append('</table></td></tr>')
 
+    # manual pins outside the default area
+    if far_sorted:
+        P.append(_section_label(f'Farther away &middot; {len(far_sorted)}', C_ACCENT))
+        P.append('<tr><td><table role="presentation" width="100%" cellpadding="0" cellspacing="0">')
+        P += [_full_row(v, show_watched=False) for v in far_sorted]
+        P.append('</table></td></tr>')
+
     # footer
     P.append(f'<tr><td style="padding-top:22px;font-family:{F_MONO};font-size:11px;'
              f'color:{C_MUTED};line-height:1.6;">Snapshot diff vs. previous run &middot; '
@@ -692,7 +736,7 @@ def build_html(curr, added, removed, newly_leaving, now, baseline, weekly=False)
 def build_email(curr, added, removed, newly_leaving, *, baseline=False, weekly=False):
     """Return (subject, text_body, html_body)."""
     now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
-    n = len(curr)
+    n = len(split_far(curr)[0])
     parts = []
     if added:
         parts.append(f"{len(added)} new")
@@ -853,14 +897,7 @@ def run(weekly=False):
     prev_watch_ids = (snap or {}).get("watch_ids", {})
     watched, watch_ids = resolve_watchlist(catalog, load_watchlist(), prev_watch_ids)
 
-    # Merge manual pins into the working set: flag a venue already nearby, or
-    # pull in a far-away one. The diff / digest then treat them uniformly.
-    curr = dict(nearby)
-    for vid, v in watched.items():
-        if vid in curr:
-            curr[vid]["watched"] = True
-        else:
-            curr[vid] = v
+    curr = merge_watched(nearby, watched)
     if watched:
         print(f"Watched venues resolved: {len(watched)} (total tracked: {len(curr)})")
 
@@ -911,9 +948,13 @@ def run_test():
     """
     blacklist = load_blacklist()
     catalog = fetch_map()
-    curr = extract_nearby(catalog, blacklist)
-    print(f"TEST: {len(curr)} nearby venues fetched.")
-    venues = sorted(curr.values(), key=lambda v: v["dist_mi"])
+    nearby = extract_nearby(catalog, blacklist)
+    print(f"TEST: {len(nearby)} nearby venues fetched.")
+    venues = sorted(nearby.values(), key=lambda v: v["dist_mi"])
+    # Resolve the real watchlist (read-only) so "Farther away" renders.
+    prev_watch_ids = (load_snapshot() or {}).get("watch_ids", {})
+    watched, _ = resolve_watchlist(catalog, load_watchlist(), prev_watch_ids)
+    curr = merge_watched(nearby, watched)
 
     # 1) Baseline-style email (full list, no changes).
     s, t, h = build_email(curr, [], [], [], baseline=True)

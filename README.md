@@ -129,10 +129,12 @@ Names are matched case-insensitively (exact match first, then unique
 substring; ties go to the venue nearest the sort anchor). Once a name resolves,
 the venue is tracked by its catalog id, so it survives renames; if the id later
 vanishes from the catalog, that is reported once as a removal and the name is
-never silently re-matched to a different venue. Watched venues appear in the
-digest with a `[WATCHED]` marker (teal badge in HTML), are exempt from the
-radius filter and blacklist, and do not show up as "newly added" when you first
-pin them; their leaving-soon and removed alerts still fire.
+never silently re-matched to a different venue. Watched venues are exempt from
+the radius filter and blacklist, and do not show up as "newly added" when you
+first pin them; their leaving-soon and removed alerts still fire. A pin already
+inside the radius appears in the nearby list with a `[WATCHED]` marker (teal
+badge in HTML). A pin outside the radius is listed in its own **Farther away**
+section below the nearby list and is not counted in the "nearby" totals.
 
 To confirm a name against the real roster before adding it:
 
@@ -144,7 +146,8 @@ DATA_DIR=./data python3 inkind_monitor.py --search "cafe"
 
 Highlights first (newly added, then leaving soon, then removed). The **full
 nearby list** is at the bottom, sorted by distance from the sort anchor, with
-`[NEW]` / `[LEAVING]` / `[WATCHED]` markers inline. Each venue line also shows an open/closed
+`[NEW]` / `[LEAVING]` / `[WATCHED]` markers inline, followed by a **Farther
+away** section for watched venues outside the radius. Each venue line also shows an open/closed
 label (`Open daily`, `Closed Mon, Tue`, or `Hours unknown`) derived from the
 catalog's `operating_hours`. Each venue name links to a Google Maps search
 (full hours, photos, reviews, menu), since inKind has no useful per-venue
